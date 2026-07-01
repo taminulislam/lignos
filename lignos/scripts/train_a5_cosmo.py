@@ -1,0 +1,342 @@
+"""A5.3 — A2 + zero-init COSMO-SAC σ-profile residual branch.
+
+Isolation test: A2_chemprop + ONE extra branch consuming the 20-D COSMO-SAC
+σ-profile descriptor (per-IL, 97.9% train coverage). No Surface_fp, no frames
+— this measures the marginal lift from σ-profile physics alone.
+
+Branch:
+  cosmo_proj(20 → 32), zero-init output layer
+  cosmo_heads[i]: Linear(32+5, 16) → Linear(16, 1), zero-init per prop
+  cosmo_gate: Parameter(-5.0) per prop
+Mask: has_cosmo = (cosmo_feat != 0).any(axis=1); zeroed rows contribute 0.
+
+At init: A5_cosmo ≡ A2. Only way to lose is runaway gate growth.
+
+Expected OOD benefit:
+  σ-profile descriptors are computed from DFT and generalize to new cation
+  or anion chemistries by construction — precisely the failure mode that
+  gave Baran CV R² = −0.41 on our leave-IL-out rerun.
+"""
+from __future__ import annotations
+import argparse, copy, json, sys
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.decomposition import PCA
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+V5 = PROJECT_ROOT / "lignos"
+sys.path.insert(0, str(V5 / "scripts"))
+from audit_residuals import PROPS, r2_per_prop, set_seed  # noqa
+from train_a2_two_stage import (
+    A2Head, A2StageTwoLigninWrapper,
+    build_chemprop_40d, preprocess_physchem, v4_base,
+)
+
+CACHE = V5 / "data" / "LignoIL_A1"
+COSMO_BANK = V5 / "data" / "cosmo_sac_feat_bank.npz"
+COSMO_DIM = 20
+A2_CKPT = V5 / "checkpoints" / "a2" / "stage1_best.pt"
+
+
+class A5CosmoHead(A2Head):
+    """A2Head + zero-init COSMO-SAC gated residual branch."""
+
+    def __init__(self, nf, n_props=8, chemprop_dim=40, cosmo_dim=COSMO_DIM):
+        super().__init__(nf, n_props, chemprop_dim)
+        self.cosmo_proj = nn.Sequential(
+            nn.Linear(cosmo_dim, 32), nn.GELU(), nn.Linear(32, 32))
+        with torch.no_grad():
+            self.cosmo_proj[-1].weight.zero_()
+            self.cosmo_proj[-1].bias.zero_()
+        self.cosmo_heads = nn.ModuleList([
+            nn.Sequential(nn.Linear(32 + 5, 16), nn.GELU(), nn.Linear(16, 1))
+            for _ in range(n_props)])
+        for h in self.cosmo_heads:
+            with torch.no_grad():
+                h[-1].weight.zero_(); h[-1].bias.zero_()
+        # Gate init −3 (sigmoid ≈ 0.047, i.e., ~5% contribution at step 0) instead
+        # of the previous −5 (≈0.7%, too pessimistic — gates never woke up in
+        # the 17756045 run).
+        self.cosmo_gate = nn.Parameter(torch.full((n_props,), -3.0))
+
+    def forward(self, v, i, t, chemprop, cosmo, has_cosmo):
+        out = super().forward(v, i, t, chemprop)
+        hc = has_cosmo.float().unsqueeze(-1) if has_cosmo.ndim == 1 else has_cosmo.float()
+        c_h = self.cosmo_proj(cosmo) * hc
+        c_in = torch.cat([c_h, t[:, :5]], -1)
+        c_delta = torch.cat([h(c_in) for h in self.cosmo_heads], -1)
+        return out + torch.sigmoid(self.cosmo_gate) * c_delta * hc
+
+
+class A5CosmoStageTwoWrapper(A2StageTwoLigninWrapper):
+    def forward(self, v, i, t, chemprop, cosmo, has_cosmo, phys, has_phys):
+        base = self.backbone(v, i, t, chemprop, cosmo, has_cosmo)
+        tmp = t[:, :5]
+        g = i * self.backbone.gate(tmp)
+        hp = has_phys.float().unsqueeze(-1) if has_phys.ndim == 1 else has_phys.float()
+        ctx = torch.cat([g, tmp, phys, hp], -1)
+        res_lignin = self.deep_lignin(ctx).squeeze(-1)
+        out = base.clone()
+        out[:, 7] = v[:, 7] + torch.sigmoid(self.alpha_lignin) * res_lignin
+        return out
+
+
+def load_cosmo_bank():
+    z = np.load(COSMO_BANK, allow_pickle=True)
+    return dict(zip(z["smiles"], z["cosmo_feat"]))
+
+
+def _canon(s):
+    try:
+        from rdkit import Chem
+        m = Chem.MolFromSmiles(s) if isinstance(s, str) else None
+        return Chem.MolToSmiles(m) if m else None
+    except Exception:
+        return s
+
+
+def assemble_cosmo(smiles, bank):
+    n = len(smiles)
+    feats = np.zeros((n, COSMO_DIM), dtype=np.float32)
+    mask = np.zeros(n, dtype=np.float32)
+    miss = 0
+    for i, s in enumerate(smiles):
+        cs = _canon(s)
+        f = bank.get(cs)
+        if f is None:
+            f = bank.get(s)
+        if f is not None:
+            feats[i] = f
+            mask[i] = 1.0
+        else:
+            miss += 1
+    print(f"[cosmo] {int(mask.sum())}/{n} rows covered by COSMO-SAC bank (miss {miss})")
+    return feats, mask
+
+
+def _load_split(s):
+    p_dft = CACHE / f"cached_{s}_dft.npz"
+    p_std = CACHE / f"cached_{s}.npz"
+    p = p_dft if p_dft.exists() else p_std
+    print(f"[{s}] loading {p.name}")
+    return {k: v for k, v in np.load(p, allow_pickle=True).items()}
+
+
+def train_stage1(seed, v4, morg, th, cp, cosmo, hc, y, device,
+                  epochs=300, patience=50, warm_start=True, freeze_a2=True):
+    """Train Stage-1 starting from A2 Stage-1 checkpoint.
+
+    warm_start=True: load A2_CKPT into inherited A2Head params, keep new
+                      cosmo_* params at zero-init.
+    freeze_a2=True : only train the new cosmo branch; A2 backbone stays at
+                      its converged 0.8401 baseline. Prevents the regression
+                      seen in the 2026-04-20 run where train-from-scratch
+                      destabilized the core-7 heads.
+    """
+    set_seed(seed)
+    n_props = y.shape[1]
+    m = A5CosmoHead(morg.shape[1], n_props, chemprop_dim=cp.shape[1]).to(device)
+
+    if warm_start and A2_CKPT.exists():
+        ckpt = torch.load(A2_CKPT, map_location=device, weights_only=False)
+        sd = ckpt["state_dict"] if isinstance(ckpt, dict) and "state_dict" in ckpt else ckpt
+        missing, unexpected = m.load_state_dict(sd, strict=False)
+        print(f"  warm-started from {A2_CKPT.name} (A2 seed={ckpt.get('seed')}, "
+              f"val_loss={ckpt.get('val_loss'):.5f}); "
+              f"{len(missing)} unmatched (new branch params), {len(unexpected)} unused")
+    else:
+        print(f"  NO warm-start (A2_CKPT missing or disabled) — training from scratch")
+
+    # Freeze inherited A2 params; train only the new cosmo branch.
+    if freeze_a2:
+        for name, p in m.named_parameters():
+            if not name.startswith(("cosmo_",)):
+                p.requires_grad = False
+
+    train_params = [p for p in m.parameters() if p.requires_grad]
+    print(f"  trainable params: {sum(p.numel() for p in train_params)} "
+          f"of {sum(p.numel() for p in m.parameters())}")
+
+    opt = AdamW(train_params, lr=5e-4, weight_decay=1e-2)
+    sch = CosineAnnealingLR(opt, T_max=epochs)
+    ts = {k: torch.from_numpy(x).to(device) for k, x in
+          dict(v=v4, i=morg, t=th, cp=cp, c=cosmo, hc=hc, y=y).items()}
+    valid = ~torch.isnan(ts["y"]); yf = torch.nan_to_num(ts["y"], 0.0)
+    ds = TensorDataset(*[ts[k].cpu() for k in ("v","i","t","cp","c","hc")],
+                        yf.cpu(), valid.cpu())
+    loader = DataLoader(ds, batch_size=32, shuffle=True)
+    best, state, bad = float("inf"), None, 0
+    for _ in range(epochs):
+        m.train()
+        for vb, ib, tb, cpb, cb, hcb, yb, vm in loader:
+            vb, ib, tb, cpb, cb, hcb, yb, vm = [x.to(device)
+                for x in (vb, ib, tb, cpb, cb, hcb, yb, vm)]
+            pred = m(vb, ib, tb, cpb, cb, hcb)
+            err2 = ((pred - yb) ** 2) * vm.float()
+            loss = err2.sum() / vm.float().sum().clamp(min=1)
+            if not torch.isfinite(loss): continue
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(train_params, 1.0); opt.step()
+        sch.step()
+        m.eval()
+        with torch.no_grad():
+            pred = m(ts["v"], ts["i"], ts["t"], ts["cp"], ts["c"], ts["hc"])
+            err2 = ((pred - yf) ** 2) * valid.float()
+            tl = (err2.sum(0) / valid.float().sum(0).clamp(min=1)).mean().item()
+        if np.isfinite(tl) and tl < best:
+            best = tl; state = {k: v.clone() for k, v in m.state_dict().items()}; bad = 0
+        else:
+            bad += 1
+            if bad >= patience: break
+    if state is not None: m.load_state_dict(state)
+    m.eval()
+    return m
+
+
+def train_stage2(s1_model, v4, morg, th, cp, cosmo, hc, phys, hp, y,
+                  device, seed, epochs=300, patience=50):
+    set_seed(seed)
+    m = A5CosmoStageTwoWrapper(copy.deepcopy(s1_model)).to(device)
+    opt = AdamW([{"params": m.deep_lignin.parameters(), "weight_decay": 1e-2},
+                  {"params": [m.alpha_lignin], "weight_decay": 0.0}], lr=1e-3)
+    sch = CosineAnnealingLR(opt, T_max=epochs)
+    ts = {k: torch.from_numpy(x).to(device) for k, x in
+          dict(v=v4, i=morg, t=th, cp=cp, c=cosmo, hc=hc, p=phys, hp=hp, y=y).items()}
+    ds = TensorDataset(*[ts[k].cpu() for k in
+                          ("v","i","t","cp","c","hc","p","hp","y")])
+    loader = DataLoader(ds, batch_size=32, shuffle=True)
+    best, state, bad = float("inf"), None, 0
+    train_params = [p for p in m.parameters() if p.requires_grad]
+    for _ in range(epochs):
+        m.train()
+        for batch in loader:
+            vb, ib, tb, cpb, cb, hcb, pb, hpb, yb = [x.to(device) for x in batch]
+            pred = m(vb, ib, tb, cpb, cb, hcb, pb, hpb)
+            lg = ~torch.isnan(yb[:, 7])
+            if lg.sum() == 0: continue
+            loss = ((pred[lg, 7] - yb[lg, 7].nan_to_num(0)) ** 2).mean()
+            if not torch.isfinite(loss): continue
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(train_params, 1.0); opt.step()
+        sch.step()
+        m.eval()
+        with torch.no_grad():
+            pred = m(ts["v"], ts["i"], ts["t"], ts["cp"], ts["c"], ts["hc"],
+                      ts["p"], ts["hp"])
+            lg = ~torch.isnan(ts["y"][:, 7])
+            tl = ((pred[lg, 7] - ts["y"][lg, 7].nan_to_num(0)) ** 2).mean().item() if lg.any() else float("inf")
+        if np.isfinite(tl) and tl < best:
+            best = tl; state = {k: v.clone() for k, v in m.state_dict().items()}; bad = 0
+        else:
+            bad += 1
+            if bad >= patience: break
+    if state is not None: m.load_state_dict(state)
+    m.eval()
+    return m
+
+
+def predict_s1(m, v4, morg, th, cp, cosmo, hc, device):
+    with torch.no_grad():
+        return m(torch.from_numpy(v4).to(device),
+                 torch.from_numpy(morg).to(device),
+                 torch.from_numpy(th).to(device),
+                 torch.from_numpy(cp).to(device),
+                 torch.from_numpy(cosmo).to(device),
+                 torch.from_numpy(hc).to(device)).cpu().numpy()
+
+
+def predict_s2(m, v4, morg, th, cp, cosmo, hc, phys, hp, device):
+    with torch.no_grad():
+        return m(torch.from_numpy(v4).to(device),
+                 torch.from_numpy(morg).to(device),
+                 torch.from_numpy(th).to(device),
+                 torch.from_numpy(cp).to(device),
+                 torch.from_numpy(cosmo).to(device),
+                 torch.from_numpy(hc).to(device),
+                 torch.from_numpy(phys).to(device),
+                 torch.from_numpy(hp).to(device)).cpu().numpy()
+
+
+def summarize(name, r2s):
+    c = [r["avg_core7"] for r in r2s]
+    out = {"name": name, "avg_r2_core7": float(np.mean(c)),
+           "std_r2_core7": float(np.std(c)), "per_prop": {}}
+    for p in PROPS:
+        vs = [r.get(p) for r in r2s if r.get(p) is not None and not np.isnan(r.get(p, float("nan")))]
+        out["per_prop"][p] = float(np.mean(vs)) if vs else float("nan")
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--n-seeds", type=int, default=10)
+    ap.add_argument("--epochs", type=int, default=300)
+    args = ap.parse_args()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}")
+    tr, va, te = _load_split("train"), _load_split("val"), _load_split("test")
+
+    pca_m = PCA(40).fit(tr["morgan_fp"])
+    m_tr, m_va, m_te = [pca_m.transform(x["morgan_fp"]).astype(np.float32)
+                         for x in (tr, va, te)]
+    cp_tr, cp_te = build_chemprop_40d(tr["chemprop_fp"], te["chemprop_fp"])
+    _, cp_va = build_chemprop_40d(tr["chemprop_fp"], va["chemprop_fp"])
+
+    p_tr, p_te = preprocess_physchem(tr["physchem_feat"], tr["has_physchem"],
+                                      te["physchem_feat"], te["has_physchem"])
+    _, p_va = preprocess_physchem(tr["physchem_feat"], tr["has_physchem"],
+                                   va["physchem_feat"], va["has_physchem"])
+    hp_tr = tr["has_physchem"].astype(np.float32)
+    hp_va = va["has_physchem"].astype(np.float32)
+    hp_te = te["has_physchem"].astype(np.float32)
+
+    # COSMO-SAC per-IL features
+    bank = load_cosmo_bank()
+    c_tr, hc_tr = assemble_cosmo(tr["smiles"], bank)
+    c_va, hc_va = assemble_cosmo(va["smiles"], bank)
+    c_te, hc_te = assemble_cosmo(te["smiles"], bank)
+
+    v4_tr, v4_va, v4_te = v4_base(tr), v4_base(va), v4_base(te)
+    y_tr, y_va, y_te = [x["targets"].astype(np.float32) for x in (tr, va, te)]
+    th_tr, th_va, th_te = tr["thermo_feat"], va["thermo_feat"], te["thermo_feat"]
+
+    s1_r2s, s2_r2s = [], []
+    for seed in range(args.n_seeds):
+        print(f"\n[seed {seed}] Stage-1 (A5 = A2 + COSMO-SAC branch)...")
+        s1 = train_stage1(seed, v4_tr, m_tr, th_tr, cp_tr, c_tr, hc_tr, y_tr,
+                           device, epochs=args.epochs)
+        r = r2_per_prop(predict_s1(s1, v4_te, m_te, th_te, cp_te, c_te, hc_te, device), y_te)
+        s1_r2s.append(r)
+        print(f"  Stage-1 core7={r['avg_core7']:.4f}  lignin={r.get('lignin_wt', float('nan')):.4f}  "
+              f"cosmo_gate={torch.sigmoid(s1.cosmo_gate).mean().item():.3f}")
+
+        print(f"[seed {seed}] Stage-2 (hardfreeze + deep lignin + physchem)...")
+        s2 = train_stage2(s1, v4_tr, m_tr, th_tr, cp_tr, c_tr, hc_tr, p_tr, hp_tr, y_tr,
+                           device, seed=seed + 100, epochs=args.epochs)
+        r2 = r2_per_prop(predict_s2(s2, v4_te, m_te, th_te, cp_te, c_te, hc_te,
+                                      p_te, hp_te, device), y_te)
+        s2_r2s.append(r2)
+        print(f"  Stage-2 core7={r2['avg_core7']:.4f}  lignin={r2.get('lignin_wt', float('nan')):.4f}")
+
+    s1 = summarize("Stage1_A5_cosmo_sac", s1_r2s)
+    s2 = summarize("Stage2_A5_cosmo_deep_lignin", s2_r2s)
+    print(f"\n{'='*70}\nA5_cosmo two-stage SUMMARY\n{'='*70}")
+    print(f"{'Stage':<40}{'core7':>10}{'std':>10}{'lignin':>10}")
+    for r in [s1, s2]:
+        lig = r["per_prop"].get("lignin_wt", float("nan"))
+        print(f"{r['name']:<40}{r['avg_r2_core7']:>10.4f}{r['std_r2_core7']:>10.4f}{lig:>10.4f}")
+
+    out = V5 / "results" / "a5_cosmo_sac.json"
+    json.dump([s1, s2], open(out, "w"), indent=2)
+    print(f"\nSaved: {out}")
+
+
+if __name__ == "__main__":
+    main()

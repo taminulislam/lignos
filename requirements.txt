@@ -1,0 +1,31 @@
+# Core
+torch>=2.0
+torchvision
+numpy
+pandas
+scikit-learn
+pyyaml
+tqdm
+
+# Cheminformatics
+rdkit
+openpyxl            # Excel dataset ingestion
+
+# Models / features
+transformers        # ViT-B/16 rendered-frame specialist
+chemprop            # D-MPNN graph specialist (backbone)
+xgboost             # gradient-boosting baselines / stacking
+
+# Plotting (figure scripts)
+matplotlib
+seaborn
+
+# Literature-mining utilities (scripts/lit_scrape/, optional)
+pyalex
+requests
+camelot-py          # table extraction (optional)
+
+# COSMO surface / sigma-profile pipeline (optional; external binaries)
+#   - Psi4 and/or NWChem  (DFT COSMO surfaces)
+#   - xtb (GFN2-xTB)      (geometry optimization)
+# Install these separately per your platform; they are not pip-managed here.

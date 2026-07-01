@@ -1,0 +1,46 @@
+#!/bin/bash
+#SBATCH --job-name=tier3_retry
+#SBATCH --account=bgte-delta-cpu
+#SBATCH --partition=cpu
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=48G
+#SBATCH --time=04:00:00
+#SBATCH --array=0-2
+#SBATCH --output=/work/nvme/bgte/kahmed2/Dataset_Chemistry/lignos/jobs/logs/tier3_retry_%A_%a.out
+#SBATCH --error=/work/nvme/bgte/kahmed2/Dataset_Chemistry/lignos/jobs/logs/tier3_retry_%A_%a.err
+set -euo pipefail
+
+# Retry the 3 pair-geometry DFT tasks that failed in the first tier-3 run.
+# Doubled memory (48 GB vs 24) and doubled walltime (4 h vs 2 h) because
+# pair geometries have 2x the atom count and can hit memory or convergence
+# limits on the baseline settings.
+
+source /u/kahmed2/miniconda3/etc/profile.d/conda.sh
+conda activate psi4
+
+REPO=/work/nvme/bgte/kahmed2/Dataset_Chemistry
+export PYTHONUNBUFFERED=1
+export PSI4_MEM_GB=40
+export PSI4_SCRATCH=/tmp/psi4_${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}
+mkdir -p "$PSI4_SCRATCH"
+export PSI_SCRATCH="$PSI4_SCRATCH"
+cd "$PSI4_SCRATCH"
+
+TASK_LIST=$REPO/data/pipeline/tier3_dft_retry_list.txt
+TASK_ID=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$TASK_LIST")
+
+echo "============================================"
+echo "Tier-3 DFT RETRY  array=${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}"
+echo "Task: ${TASK_ID}"
+echo "Date: $(date)"
+echo "============================================"
+
+python3 "$REPO/scripts/pipeline/step3_psi4_cosmo.py" \
+    --compound-id "${TASK_ID}" \
+    --geom-dir "$REPO/data/pipeline/geometries" \
+    --out-dir "$REPO/data/pipeline/dft_surface"
+
+rm -rf "$PSI4_SCRATCH"
+echo "Done: $(date)"

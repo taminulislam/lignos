@@ -1,0 +1,60 @@
+# ---- Data (proprietary / not distributed) ----
+# anchored to repo root so source dirs are NOT ignored
+/data/
+/lignos/data/
+*.xlsx
+*.csv
+*.npz
+*.npy
+*.off
+*.xyz
+*.zmat
+*.sdf
+*.mol
+*.pdb
+PEDRA.OUT*
+cavity*
+psi*.clean
+*.movecs
+*.db
+
+# ---- Trained models / checkpoints ----
+/checkpoints/
+/lignos/checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+
+# ---- Logs / job output ----
+/jobs/logs/
+/lignos/jobs/logs/
+slurm-*.out
+*.out
+*.err
+*.log
+wandb/
+timer.dat
+
+# ---- Results / figures / scratch (regenerated from code) ----
+/results/
+/lignos/results/
+/lignos/scratch/
+/lignos/article/
+/lignos/notebooks/
+*.png
+*.pdf
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# ---- Editor / OS ----
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,51 @@
+# Ablation Study Configurations
+# Each experiment enables/disables specific components
+
+experiments:
+  A0_v4_baseline:
+    description: "v4 baseline (no images)"
+    enable_multiview_vit: false
+    enable_siamese: false
+    enable_cross_modal_attention: false
+    use_v4_gated_fusion: true
+
+  A1_vit_no_pretrain:
+    description: "Add Multi-View ViT (random init, no SimCLR)"
+    enable_multiview_vit: true
+    vit_pretrained: false
+    enable_siamese: false
+    enable_cross_modal_attention: false
+
+  A2_vit_simclr:
+    description: "Add Multi-View ViT (SimCLR pre-trained)"
+    enable_multiview_vit: true
+    vit_pretrained: true
+    enable_siamese: false
+    enable_cross_modal_attention: false
+
+  A3_vit_siamese:
+    description: "Add both ViT + Siamese"
+    enable_multiview_vit: true
+    vit_pretrained: true
+    enable_siamese: true
+    enable_cross_modal_attention: false
+
+  A4_cross_attention:
+    description: "Replace gates with cross-modal attention"
+    enable_multiview_vit: true
+    vit_pretrained: true
+    enable_siamese: true
+    enable_cross_modal_attention: true
+
+  A5_full_v5:
+    description: "Full COSMOBridge v5 (all components)"
+    enable_multiview_vit: true
+    vit_pretrained: true
+    enable_siamese: true
+    enable_cross_modal_attention: true
+    use_property_routing: true
+
+# Common settings for all ablations
+common:
+  seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+  output_dir: "results/ablation"

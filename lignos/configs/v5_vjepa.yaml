@@ -1,0 +1,103 @@
+# COSMOBridge v5 Training with V-JEPA Pre-trained ViT
+# Identical to v5_full.yaml except using V-JEPA checkpoint instead of SimCLR
+
+data:
+  train_csv: "../data/processed/splits/train.csv"
+  val_csv: "../data/processed/splits/val.csv"
+  test_csv: "../data/processed/splits/test.csv"
+  cosmo_images_dir: "data/cosmo_images"
+  ion_images_dir: "data/ion_images"
+  point_clouds_dir: "../data/pipeline/point_clouds"
+  n_views: 36
+  image_size: 224
+  num_workers: 4
+  view_sample_k: 12
+
+model:
+  embed_dim: 256
+  n_properties: 7
+  dropout: 0.2
+
+  multiview_vit:
+    n_views: 36
+    embed_dim: 192
+    patch_size: 16
+    num_vit_layers: 6
+    num_vit_heads: 3
+    num_view_attn_layers: 2
+    num_view_attn_heads: 4
+    # V-JEPA checkpoint instead of SimCLR
+    pretrained_checkpoint: "checkpoints/vjepa/vit_pretrained_vjepa.pt"
+
+  siamese:
+    embed_dim: 192
+    n_heads: 4
+    encoder_channels: [32, 64, 128, 256]
+
+  graph:
+    dim: 300
+    checkpoint: "../checkpoints/chemprop/best.pt"
+    freeze: true
+
+  pointcloud:
+    dim: 256
+    checkpoint: "../checkpoints/pointcloud/best.pt"
+    freeze: true
+
+  tabular:
+    dim: 25
+
+  fusion:
+    n_cross_attn_heads: 4
+    cross_attn_dropout: 0.1
+
+  routing_init:
+    gamma1:  [ 1.5,  1.0, -0.5,  1.0,  0.0]
+    gamma2:  [ 1.5,  1.0, -0.5,  1.0,  0.0]
+    G_E:     [-0.5, -0.5,  1.5,  0.0,  0.5]
+    H_E:     [ 0.0,  0.0,  1.0,  0.5,  0.5]
+    G_mix:   [-0.5, -0.5,  1.5,  0.0,  0.5]
+    H_vap:   [ 0.5,  0.5,  0.5,  0.5,  0.5]
+    P:       [ 1.0,  0.5,  0.0,  1.0,  0.0]
+
+training:
+  stage1:
+    epochs: 5
+    lr: 1.0e-3
+    freeze_encoders: true
+
+  stage2:
+    epochs: 50
+    image_lr: 1.0e-4
+    fusion_lr: 1.0e-3
+    freeze_graph: true
+    freeze_pointcloud: true
+    early_stopping_patience: 20
+
+  stage3:
+    epochs: 30
+    lr: 1.0e-5
+    gradient_clip: 1.0
+    only_if_r2_below: 0.90
+
+  optimizer: "adamw"
+  weight_decay: 1.0e-3
+  batch_size: 32
+  scheduler: "cosine"
+  label_smoothing: 0.05
+  anchor_loss_lambda: 0.05
+
+  seeds: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+
+  # Save to separate directory for comparison
+  checkpoint_dir: "checkpoints/supervised_vjepa"
+
+evaluation:
+  bootstrap_iterations: 10000
+  confidence_level: 0.95
+  statistical_test: "wilcoxon"
+
+output:
+  checkpoint_dir: "checkpoints/supervised_vjepa"
+  results_dir: "results/vjepa"
+  figures_dir: "results/vjepa/figures"
